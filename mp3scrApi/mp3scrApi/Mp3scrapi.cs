@@ -1003,9 +1003,12 @@ namespace mp3scrApi
             {
                 if (sf.Items.Any())
                 {
-                    // Get the earliest item
+                    // Get the date of the earliest item
                     DateTimeOffset firstItemByModDt = (from feedItem in sf.Items
                                                        select feedItem.LastUpdatedTime).Min();
+                    // Get the date of the latest item
+                    DateTimeOffset lastItemByModDt = (from feedItem in sf.Items
+                                                       select feedItem.LastUpdatedTime).Max();
                     // The source may be just a directory of MP3 items, all saved at the same time.
                     // It may not be possible to know how often items were created. Assume a new item was written once per week.
                     // Determine the index of "today's" item that should be chosen based on a wraparound time period.
@@ -1017,7 +1020,28 @@ namespace mp3scrApi
                     // selectIndex = 8 % 5 = 3, i.e., the item we want to keep in the generated feed is items[3], the 4th item.
                     // 100 items is 1.9 years worth of weekly items. 401 items is 4.4 years worth of 4-day items.
                     // You'll never cycle through thousands of items unless you're podcatching multiple times per day.
-                    int selectIndex = periodsSinceFirst % sf.Items.Count();
+                    int selectIndex = sf.Items.Count() - 1;
+                    if ((DateTime.Now - lastItemByModDt.LocalDateTime).Days <= 30)
+                    {
+                        // The most recent item is <= 30 days old. The source published a new item. Use this instead of the wraparound algorithm.
+                        // It will usually be the last one, so count backwards.
+                        for (int iii = sf.Items.Count() - 1; iii >= 0; iii--)
+                        {
+                            // If somehow, no match is found, selectIndex will point to the last item, whether or not the date is the latest date.
+                            // This will usually be the desired item.
+                            if (sf.Items.ElementAt(iii).LastUpdatedTime == lastItemByModDt)
+                            {
+                                selectIndex = iii;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // The most recent item is > 30 days old. Use the wraparound algorithm.
+                        // The default value of selectIndex from above will be overwritten.
+                        selectIndex = periodsSinceFirst % sf.Items.Count();
+                    }
                     SyndicationItem siKeep = sf.Items.ElementAt(selectIndex);
                     // Pretend it was just published today
                     siKeep.LastUpdatedTime = new DateTimeOffset(DateTime.UtcNow, new TimeSpan(0));
