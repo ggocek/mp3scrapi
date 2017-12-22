@@ -1,0 +1,5 @@
+c:\users\gary\documents\visual studio 2015\Projects\mp3scrApi\mp3scrApi\bin\Debug\mp3scrApi.dll
+c:\users\gary\documents\visual studio 2015\Projects\mp3scrApi\mp3scrApi\bin\Debug\mp3scrApi.pdb
+c:\users\gary\documents\visual studio 2015\Projects\mp3scrApi\mp3scrApi\obj\Debug\mp3scrApi.dll
+c:\users\gary\documents\visual studio 2015\Projects\mp3scrApi\mp3scrApi\obj\Debug\mp3scrApi.pdb
+c:\users\gary\documents\visual studio 2015\Projects\mp3scrApi\mp3scrApi\obj\Debug\mp3scrApi.csprojResolveAssemblyReference.cache
