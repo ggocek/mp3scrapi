@@ -38,6 +38,7 @@ namespace mp3scrApi
             allowHttps = false;
             wraparound = false;
             scrapeExtension = ".mp3";
+            maxWebRequests = 20;
         }
 
         /// <summary>
@@ -523,6 +524,27 @@ namespace mp3scrApi
             scrapeExtension = (o == null) ? string.Empty : o.ToString();
         }
 
+        // Private cache for MaxWebRequests
+        private int maxWebRequests = 20;
+        /// <summary>
+        /// Maximum number of items to investigate via a web request, for eventual entry into RSS.
+        /// </summary>
+        public int MaxWebRequests
+        {
+            get { return maxWebRequests; }
+            set { maxWebRequests = value; }
+        }
+        /// <summary>
+        /// Set the maxWebRequests property from an object, such as a config file value
+        /// </summary>
+        /// <param name="o"></param>
+        public void MaxWebRequestsFromObj(object o)
+        {
+            maxWebRequests = -1;
+            if (o != null)
+                int.TryParse(o.ToString(), out maxWebRequests);
+        }
+
         /// <summary>
         /// Get the markup of a URL from the config file.
         /// </summary>
@@ -798,16 +820,30 @@ namespace mp3scrApi
         /// <param name="guidPrefix">From the config file</param>
         /// <param name="homeUrl">From the config file</param>
         /// <param name="pubDate">The number</param>
-        /// <returns>The item</returns>
+        /// <returns>The item or an exception with info on what went wrong when trying to get the file info or null if couldn't get the info</returns>
         public SyndicationItem ItemForMp3(string mp3Addr, string itemDescPrefix, string guidPrefix,
             string homeUrl, bool allowHttps)
         {
             // First make sure the link points to a real file
             long mp3Size = 0L;
             DateTime mp3Mod = DateTime.UtcNow;
-            bool exists = Mp3Info(mp3Addr, out mp3Size, out mp3Mod);
+            bool exists = false;
+            try
+            {
+                exists = Mp3Info(mp3Addr, out mp3Size, out mp3Mod);
+            }
+            catch (WebException)
+            {
+                exists = false; // Might be info in this exception and its inner exception
+                throw;
+            }
+            catch (Exception)
+            {
+                exists = false;
+                throw;
+            }
             if (!exists)
-                return null;
+                return null; // Retried a couple times but could not get the file info
 
             // The W3C RSS validator reports a failure when an enclosure address uses https. After the MP3 is proved to exist (just above),
             // convert https to http if necessary. As far as I can tell, the resulting http link always works.
@@ -861,12 +897,45 @@ namespace mp3scrApi
                 try
                 {
                     System.Net.HttpWebRequest req = System.Net.HttpWebRequest.CreateHttp(mp3Url);
+                    // Some sites say to set req.Method = "POST", but this hasn't seemed to be necessary.
+                    // UserAgent seems to be important for some sites.
+                    req.UserAgent = "gocek.org";
                     using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
                     {
                         if (resp.StatusCode == System.Net.HttpStatusCode.OK)
                         {
                             fileBytes = resp.ContentLength;
                             fileLastMod = resp.LastModified.ToUniversalTime();
+                        }
+                    }
+                }
+                catch (WebException webEx)
+                {
+                    if (fileBytes == -2L)
+                    {
+                        // Retry once, maybe we'll get lucky
+                        fileBytes++;
+                        System.Threading.Thread.Sleep(7000);
+                    }
+                    else
+                    {
+                        // Second WebException - throw back with the information
+                        WebResponse webResponse = webEx.Response;
+                        using (System.IO.Stream respStr = webResponse.GetResponseStream())
+                        {
+                            if (respStr == null)
+                            {
+                                throw;
+                            }
+                            using (System.IO.StreamReader reader = new System.IO.StreamReader(respStr))
+                            {
+                                if (reader == null)
+                                {
+                                    throw;
+                                }
+                                string text = reader.ReadToEnd();
+                                throw new WebException(text, webEx);
+                            }
                         }
                     }
                 }
@@ -982,6 +1051,8 @@ namespace mp3scrApi
         /// <returns>A list with one item. That is the item to be saved into the RSS feed.</returns>
         public List<SyndicationItem> WrapAroundItems(SyndicationFeed sf)
         {
+            DateTimeOffset forcedLastTimestamp = new DateTimeOffset(new DateTime(2016, 12, 31, 0, 0, 0), new TimeSpan(0));
+
             // Set the wraparound period according to the number of items in the source feed.
             double wrapDays = 7D; // skip to the next item every seventh day
             if (sf.Items.Count() > 700)
@@ -1003,45 +1074,54 @@ namespace mp3scrApi
             {
                 if (sf.Items.Any())
                 {
-                    // Get the date of the earliest item
-                    DateTimeOffset firstItemByModDt = (from feedItem in sf.Items
-                                                       select feedItem.LastUpdatedTime).Min();
+                    // There is at least one item, default to returning the last one (the latest one).
+                    int selectIndex = sf.Items.Count() - 1;
                     // Get the date of the latest item
                     DateTimeOffset lastItemByModDt = (from feedItem in sf.Items
                                                        select feedItem.LastUpdatedTime).Max();
-                    // The source may be just a directory of MP3 items, all saved at the same time.
-                    // It may not be possible to know how often items were created. Assume a new item was written once per week.
-                    // Determine the index of "today's" item that should be chosen based on a wraparound time period.
-                    // Start with the number of periods of wrapDays days, from the oldest item to today.
-                    int periodsSinceFirst = Convert.ToInt32((DateTime.UtcNow - firstItemByModDt).TotalDays / wrapDays);
-                    // Let's say the first item was Jan 1 2000, and today is Mar 1 2000.
-                    // And let's say there are five items in the feed, indices 0-4.
-                    // The number of days is 31 + 29 + 1 = 61, and periodsSinceFirst = 8 (since wrapDays is 7 for a feed with 5 items).
-                    // selectIndex = 8 % 5 = 3, i.e., the item we want to keep in the generated feed is items[3], the 4th item.
-                    // 100 items is 1.9 years worth of weekly items. 401 items is 4.4 years worth of 4-day items.
-                    // You'll never cycle through thousands of items unless you're podcatching multiple times per day.
-                    int selectIndex = sf.Items.Count() - 1;
-                    if ((DateTime.Now - lastItemByModDt.LocalDateTime).Days <= 30)
+
+                    // Determine if an item has recenly been added to the feed
+                    if (((DateTime.Now - lastItemByModDt.LocalDateTime).Days >= 2) &&
+                        ((DateTime.Now - lastItemByModDt.LocalDateTime).Days <= 30) &&
+                        (sf.Items.ElementAt(sf.Items.Count() - 1).LastUpdatedTime == lastItemByModDt))
                     {
-                        // The most recent item is <= 30 days old. The source published a new item. Use this instead of the wraparound algorithm.
-                        // It will usually be the last one, so count backwards.
-                        for (int iii = sf.Items.Count() - 1; iii >= 0; iii--)
-                        {
-                            // If somehow, no match is found, selectIndex will point to the last item, whether or not the date is the latest date.
-                            // This will usually be the desired item.
-                            if (sf.Items.ElementAt(iii).LastUpdatedTime == lastItemByModDt)
-                            {
-                                selectIndex = iii;
-                                break;
-                            }
-                        }
+                        // The most recent item is between 2 and 30 days old and the LastUpdatedTime of the last item in the list is the latest LastUpdatedTime.
+                        // The source published a new item. Use this instead of the wraparound algorithm.
+                        selectIndex = sf.Items.Count() - 1;
                     }
                     else
                     {
-                        // The most recent item is > 30 days old. Use the wraparound algorithm.
-                        // The default value of selectIndex from above will be overwritten.
+                        // Most MP3 files in most feeds will have a reasonable LastUpdatedTime. The clause above verifies that by considering only files at
+                        // least two days old. But sometimes, LastUpdatedTime is junk, and may appear as the current date-time. So, aside from new items
+                        // located above, never assume LastUpdatedTime is valid.  Assume the list of items is in ascending date-time order.
+                        // Force a timestamp because if all the items have the same LastUpdatedTime, the same item will be selected every time.
+                        // Start at 12/31/2016 (forcedLastTimestamp from above).
+                        for (int iii = sf.Items.Count() - 1; iii >= 0; iii--)
+                        {
+                            // Set the current item's LastUpdatedTime to the current value of forcedLastTimestamp
+                            sf.Items.ElementAt(iii).LastUpdatedTime = forcedLastTimestamp;
+                            // Move backwards in time some number of days
+                            forcedLastTimestamp = (forcedLastTimestamp - new TimeSpan(Convert.ToInt32(wrapDays), 0, 0, 0));
+                        }
+
+                        // Now the wraparound algorithm:
+                        // Get the date of the earliest item. The point of forcing the timestamps is that for a defunct feed, the number
+                        // of items will always be the same and firstItemByModDt will always be the same as long as wrapDays isn't changed
+                        // and the initial value of forcedLastTimestamp isn't changed. As UtcNow progresses, selectIndex will progress.
+                        DateTimeOffset firstItemByModDt = (from feedItem in sf.Items
+                                                           select feedItem.LastUpdatedTime).Min();
+                        // Determine the index of the item that should be chosen based on a wraparound time period.
+                        // Start with the number of periods of wrapDays days, from the oldest item to today.
+                        int periodsSinceFirst = Convert.ToInt32((DateTime.UtcNow - firstItemByModDt).TotalDays / wrapDays);
+                        // Let's say the first item was Jan 1 2000, and today is Mar 1 2000.
+                        // And let's say there are five items in the feed, indices 0-4.
+                        // The number of days is 31 + 29 + 1 = 61, and periodsSinceFirst = 8 (since wrapDays is 7 for a feed with 5 items).
+                        // selectIndex = 8 % 5 = 3, i.e., the item we want to keep in the generated feed is items[3], the 4th item.
+                        // 100 items is 1.9 years worth of weekly items. 401 items is 4.4 years worth of 4-day items.
+                        // You'll never cycle through thousands of items unless you're podcatching multiple times per day.
                         selectIndex = periodsSinceFirst % sf.Items.Count();
                     }
+
                     SyndicationItem siKeep = sf.Items.ElementAt(selectIndex);
                     // Pretend it was just published today
                     siKeep.LastUpdatedTime = new DateTimeOffset(DateTime.UtcNow, new TimeSpan(0));
@@ -1052,7 +1132,7 @@ namespace mp3scrApi
             }
             catch
             {
-                // The whole feed will be written as if defunct feed processing did not occur
+                // Return null. The caller will presumably continue as if defunct feed processing did not occur.
             }
             return null;
         }
