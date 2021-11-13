@@ -38,6 +38,7 @@ namespace mp3scrApi
             allowHttps = false;
             wraparound = false;
             scrapeExtension = ".mp3";
+            maxWebRequests = 20;
         }
 
         /// <summary>
@@ -523,6 +524,27 @@ namespace mp3scrApi
             scrapeExtension = (o == null) ? string.Empty : o.ToString();
         }
 
+        // Private cache for MaxWebRequests
+        private int maxWebRequests = 20;
+        /// <summary>
+        /// Maximum number of items to investigate via a web request, for eventual entry into RSS.
+        /// </summary>
+        public int MaxWebRequests
+        {
+            get { return maxWebRequests; }
+            set { maxWebRequests = value; }
+        }
+        /// <summary>
+        /// Set the maxWebRequests property from an object, such as a config file value
+        /// </summary>
+        /// <param name="o"></param>
+        public void MaxWebRequestsFromObj(object o)
+        {
+            maxWebRequests = -1;
+            if (o != null)
+                int.TryParse(o.ToString(), out maxWebRequests);
+        }
+
         /// <summary>
         /// Get the markup of a URL from the config file.
         /// </summary>
@@ -798,16 +820,30 @@ namespace mp3scrApi
         /// <param name="guidPrefix">From the config file</param>
         /// <param name="homeUrl">From the config file</param>
         /// <param name="pubDate">The number</param>
-        /// <returns>The item</returns>
+        /// <returns>The item or an exception with info on what went wrong when trying to get the file info or null if couldn't get the info</returns>
         public SyndicationItem ItemForMp3(string mp3Addr, string itemDescPrefix, string guidPrefix,
             string homeUrl, bool allowHttps)
         {
             // First make sure the link points to a real file
             long mp3Size = 0L;
             DateTime mp3Mod = DateTime.UtcNow;
-            bool exists = Mp3Info(mp3Addr, out mp3Size, out mp3Mod);
+            bool exists = false;
+            try
+            {
+                exists = Mp3Info(mp3Addr, out mp3Size, out mp3Mod);
+            }
+            catch (WebException)
+            {
+                exists = false; // Might be info in this exception and its inner exception
+                throw;
+            }
+            catch (Exception)
+            {
+                exists = false;
+                throw;
+            }
             if (!exists)
-                return null;
+                return null; // Retried a couple times but could not get the file info
 
             // The W3C RSS validator reports a failure when an enclosure address uses https. After the MP3 is proved to exist (just above),
             // convert https to http if necessary. As far as I can tell, the resulting http link always works.
@@ -861,12 +897,45 @@ namespace mp3scrApi
                 try
                 {
                     System.Net.HttpWebRequest req = System.Net.HttpWebRequest.CreateHttp(mp3Url);
+                    // Some sites say to set req.Method = "POST", but this hasn't seemed to be necessary.
+                    // UserAgent seems to be important for some sites.
+                    req.UserAgent = "gocek.org";
                     using (System.Net.HttpWebResponse resp = (System.Net.HttpWebResponse)req.GetResponse())
                     {
                         if (resp.StatusCode == System.Net.HttpStatusCode.OK)
                         {
                             fileBytes = resp.ContentLength;
                             fileLastMod = resp.LastModified.ToUniversalTime();
+                        }
+                    }
+                }
+                catch (WebException webEx)
+                {
+                    if (fileBytes == -2L)
+                    {
+                        // Retry once, maybe we'll get lucky
+                        fileBytes++;
+                        System.Threading.Thread.Sleep(7000);
+                    }
+                    else
+                    {
+                        // Second WebException - throw back with the information
+                        WebResponse webResponse = webEx.Response;
+                        using (System.IO.Stream respStr = webResponse.GetResponseStream())
+                        {
+                            if (respStr == null)
+                            {
+                                throw;
+                            }
+                            using (System.IO.StreamReader reader = new System.IO.StreamReader(respStr))
+                            {
+                                if (reader == null)
+                                {
+                                    throw;
+                                }
+                                string text = reader.ReadToEnd();
+                                throw new WebException(text, webEx);
+                            }
                         }
                     }
                 }
